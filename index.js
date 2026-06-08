@@ -188,7 +188,89 @@ async function createShopifyOrder(rec, paymentId) {
   console.log('Shopify order created:', r.data.order && r.data.order.id);
   return r.data.order;
 }
+// === Path A: create Draft Order from cart, then init Freedom Pay ===
+app.post('/order/create', async (req, res) => {
+  try {
+    const { items, customer, address, note, discount_code } = req.body;
 
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Cart is empty' });
+    }
+
+    // 1. Build Draft Order payload
+    const draft = {
+      draft_order: {
+        line_items: items.map(i => ({
+          variant_id: Number(i.variant_id),
+          quantity: Number(i.quantity) || 1,
+        })),
+        note: note || '',
+        tags: 'freedom_pay',
+        email: (customer && customer.email) || undefined,
+        shipping_address: address ? {
+          first_name: (customer && customer.name) || '',
+          address1: address,
+          phone: (customer && customer.phone) || '',
+        } : undefined,
+      },
+    };
+    if (discount_code) {
+      draft.draft_order.applied_discount = {
+        description: discount_code,
+        value_type: 'percentage',
+        value: '0',
+        title: discount_code,
+      };
+    }
+
+    const draftRes = await axios.post(
+      'https://' + SHOPIFY_STORE + '/admin/api/2024-01/draft_orders.json',
+      draft,
+      { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+    );
+
+    const draftOrder = draftRes.data.draft_order;
+    const orderId = draftOrder.id;
+    const amount = draftOrder.total_price; // KGS
+
+    // 2. Init Freedom Pay payment
+    const salt = randomSalt();
+    const params = {
+      pg_merchant_id: FREEDOM_MERCHANT_ID,
+      pg_order_id: String(orderId),
+      pg_amount: String(amount),
+      pg_currency: 'KGS',
+      pg_description: 'Заказ #' + orderId,
+      pg_salt: salt,
+      pg_result_url: SERVER_URL + '/freedompay/result',
+      pg_success_url: 'https://' + SHOPIFY_STORE + '/pages/payment-success',
+      pg_failure_url: 'https://' + SHOPIFY_STORE + '/pages/payment-failed',
+      pg_language: 'ru',
+      pg_testing_mode: process.env.NODE_ENV === 'production' ? '0' : '1',
+    };
+    if (customer && customer.email) params.pg_user_contact_email = customer.email;
+    if (customer && customer.phone) params.pg_user_phone = customer.phone;
+    params.pg_sig = generateSig('init_payment.php', params, FREEDOM_SECRET_KEY);
+
+    const fpRes = await axios.post(
+      FREEDOM_BASE_URL + '/init_payment.php',
+      new URLSearchParams(params).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+
+    const redirectMatch = fpRes.data.match(/<pg_redirect_url>(.*?)<\/pg_redirect_url>/);
+    const statusMatch = fpRes.data.match(/<pg_status>(.*?)<\/pg_status>/);
+    if (statusMatch && statusMatch[1] === 'ok' && redirectMatch) {
+      return res.json({ redirect_url: redirectMatch[1], order_id: orderId });
+    }
+    const errMatch = fpRes.data.match(/<pg_error_description>(.*?)<\/pg_error_description>/);
+    console.error('Freedom Pay error:', fpRes.data);
+    return res.status(400).json({ error: errMatch ? errMatch[1] : 'Payment init error' });
+  } catch (err) {
+    console.error('order/create error:', err.message, err.response && JSON.stringify(err.response.data));
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
 app.get('/', (req, res) => res.json({ status: 'Freedom Pay server running', merchant_id: FREEDOM_MERCHANT_ID }));
 
 const PORT = process.env.PORT || 3000;
