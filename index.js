@@ -1,196 +1,197 @@
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const FREEDOM_MERCHANT_ID  = process.env.FREEDOM_MERCHANT_ID;
-const FREEDOM_SECRET_KEY   = process.env.FREEDOM_SECRET_KEY;
-const FREEDOM_BASE_URL     = process.env.FREEDOM_BASE_URL || 'https://api.freedompay.kg';
-const SHOPIFY_STORE        = process.env.SHOPIFY_STORE || 'aikill.myshopify.com';
-const SERVER_URL           = process.env.SERVER_URL;
+// --- ENV ---
+const FREEDOM_MERCHANT_ID = process.env.FREEDOM_MERCHANT_ID;
+const FREEDOM_SECRET_KEY = process.env.FREEDOM_SECRET_KEY;
+const FREEDOM_BASE_URL = process.env.FREEDOM_BASE_URL || 'https://api.freedompay.kg';
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE || 'aikill.myshopify.com';
 const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const SERVER_URL = process.env.SERVER_URL;          // напр. https://xxx.up.railway.app
+const STORE_URL = process.env.STORE_URL || 'https://nfo.kg';
+const TESTING_MODE = process.env.FP_TESTING_MODE || '1'; // '1' для теста, '0' для боя
 
+// --- DB ---
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payments (
+      order_ref   TEXT PRIMARY KEY,
+      amount      NUMERIC NOT NULL,
+      currency    TEXT NOT NULL,
+      cart        JSONB NOT NULL,
+      customer    JSONB NOT NULL,
+      status      TEXT NOT NULL DEFAULT 'pending',
+      shopify_order_id TEXT,
+      created_at  TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+  console.log('DB ready');
+}
+
+// --- helpers ---
 function generateSig(scriptName, params, secretKey) {
-    const sorted = Object.keys(params).sort().reduce((acc, key) => {
-          acc[key] = params[key];
-          return acc;
-    }, {});
-    const values = [scriptName, ...Object.values(sorted), secretKey];
-    return crypto.createHash('md5').update(values.join(';')).digest('hex');
+  const sorted = Object.keys(params).sort().reduce((acc, key) => {
+    acc[key] = params[key];
+    return acc;
+  }, {});
+  const values = [scriptName, ...Object.values(sorted), secretKey];
+  return crypto.createHash('md5').update(values.join(';')).digest('hex');
 }
-
 function randomSalt() {
-    return crypto.randomBytes(16).toString('hex');
+  return crypto.randomBytes(8).toString('hex');
+}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// POST к Freedom Pay с retry/timeout (лечит ETIMEDOUT)
+async function fpInitPayment(params) {
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await axios.post(
+        FREEDOM_BASE_URL + '/init_payment.php',
+        new URLSearchParams(params).toString(),
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 8000 }
+      );
+      return res.data;
+    } catch (err) {
+      lastErr = err;
+      console.error(`FP attempt ${attempt} failed:`, err.message);
+      if (attempt < 3) await sleep(1800);
+    }
+  }
+  throw lastErr;
 }
 
-app.post('/freedompay/create', async (req, res) => {
-    try {
-          const { order_id, amount, currency, description, customer_email } = req.body;
-          const salt = randomSalt();
-          const params = {
-                  pg_merchant_id:  FREEDOM_MERCHANT_ID,
-                  pg_order_id:     String(order_id),
-                  pg_amount:       String(amount),
-                  pg_currency:     currency || 'KGS',
-                  pg_description:  description || 'Заказ #' + order_id,
-                  pg_salt:         salt,
-                  pg_result_url:   SERVER_URL + '/freedompay/result',
-                  pg_success_url:  'https://' + SHOPIFY_STORE + '/pages/payment-success',
-                  pg_failure_url:  'https://' + SHOPIFY_STORE + '/pages/payment-failed',
-                  pg_language:     'ru',
-                  pg_testing_mode: process.env.NODE_ENV === 'production' ? '0' : '1',
-          };
-          if (customer_email) params.pg_user_contact_email = customer_email;
-          params.pg_sig = generateSig('init_payment.php', params, FREEDOM_SECRET_KEY);
-          const response = await axios.post(
-                  FREEDOM_BASE_URL + '/init_payment.php',
-                  new URLSearchParams(params).toString(),
-            { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-                );
-          const redirectMatch = response.data.match(/<pg_redirect_url>(.*?)<\/pg_redirect_url>/);
-          const statusMatch   = response.data.match(/<pg_status>(.*?)<\/pg_status>/);
-          if (statusMatch && statusMatch[1] === 'ok' && redirectMatch) {
-                  res.json({ redirect_url: redirectMatch[1] });
-          } else {
-                  const errMatch = response.data.match(/<pg_error_description>(.*?)<\/pg_error_description>/);
-                  console.error('Freedom Pay error:', response.data);
-                  res.status(400).json({ error: errMatch ? errMatch[1] : 'Payment creation error' });
-          }
-    } catch (err) {
-          console.error('Create payment error:', err.message);
-          res.status(500).json({ error: 'Server error' });
-    }
-});
-
-app.post('/freedompay/result', async (req, res) => {
-    try {
-          const params = { ...req.body };
-          const receivedSig = params.pg_sig;
-          delete params.pg_sig;
-          const expectedSig = generateSig('result', params, FREEDOM_SECRET_KEY);
-          if (receivedSig !== expectedSig) {
-                  console.error('Invalid signature');
-                  return res.type('xml').send('<?xml version="1.0" encoding="UTF-8"?><response><pg_status>error</pg_status><pg_description>Invalid signature</pg_description></response>');
-          }
-          const { pg_order_id, pg_payment_id, pg_result, pg_status } = params;
-        console.log('Payment result — order:', pg_order_id, '| pg_result:', pg_result, '| pg_status:', pg_status, '| payment_id:', pg_payment_id);
-          if (pg_result === '1' || pg_status === 'ok') {
-                  await confirmShopifyOrder(pg_order_id, pg_payment_id);
-          }
-          res.type('xml').send('<?xml version="1.0" encoding="UTF-8"?><response><pg_status>ok</pg_status></response>');
-    } catch (err) {
-          console.error('Result webhook error:', err.message);
-          res.type('xml').send('<?xml version="1.0" encoding="UTF-8"?><response><pg_status>error</pg_status></response>');
-    }
-});
-
-async function confirmShopifyOrder(orderId, paymentId) {
-    if (!SHOPIFY_ACCESS_TOKEN) { console.warn('SHOPIFY_ACCESS_TOKEN not set'); return; }
-    try {
-          const url = 'https://' + SHOPIFY_STORE + '/admin/api/2024-01/orders/' + orderId + '/transactions.json';
-          await axios.post(url, {
-                  transaction: { kind: 'capture', status: 'success', gateway: 'freedom_pay', message: 'Freedom Pay ID: ' + paymentId }
-          }, { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } });
-          console.log('Shopify order', orderId, 'marked as paid');
-    } catch (err) {
-          console.error('Shopify confirm error:', err.message);
-    }
-}
-
-app.get('/auth/callback', async (req, res) => {
-      const { code, shop } = req.query;
-      if (!code) return res.status(400).send('No code provided');
-      try {
-              const tokenRes = await axios.post(`https://${shop || 'aikill.myshopify.com'}/admin/oauth/access_token`, {
-                        client_id: process.env.SHOPIFY_API_KEY,
-                        client_secret: process.env.SHOPIFY_API_SECRET,
-                        code
-              });
-              const token = tokenRes.data.access_token;
-              console.log('ACCESS TOKEN:', token);
-              res.send(`<h2>Access Token obtained!</h2><p>Copy this token and save it as SHOPIFY_ACCESS_TOKEN in Vercel:</p><pre style="background:#f0f0f0;padding:20px;font-size:16px">${token}</pre><p>Also set SHOPIFY_API_SECRET in Vercel env variables.</p>`);
-      } catch (err) {
-              res.status(500).send('Error: ' + err.message + ' | ' + JSON.stringify(err.response && err.response.data));
-      }
-});
-// Webhook от Shopify — новый заказ
-app.post('/shopify/order-created', async (req, res) => {
-  res.status(200).json({ ok: true }); // отвечаем сразу чтобы Shopify не повторял
+// --- 1) Старт оплаты: принимает корзину + данные доставки ---
+app.post('/pay/start', async (req, res) => {
   try {
-    const order = req.body;
-    if (!order || !order.id) return;
-    const gateway = (order.gateway || order.payment_gateway || '').toLowerCase();
-    if (!gateway.includes('freedom') && !gateway.includes('manual') && gateway !== '') {
-      console.log('Skip order', order.id, '- gateway:', gateway);
-      return;
+    const { cart, customer } = req.body;
+    if (!cart || !cart.items || !cart.items.length) {
+      return res.status(400).json({ error: 'Empty cart' });
     }
-    console.log('New Freedom Pay order:', order.id, 'gateway:', gateway);
-    const salt = randomSalt();
+    // cart.total_price приходит в тиынах -> сомы
+    const amountSom = (Number(cart.total_price) / 100).toFixed(2);
+    const orderRef = 'NFO-' + Date.now() + '-' + crypto.randomBytes(3).toString('hex');
+
+    await pool.query(
+      `INSERT INTO payments (order_ref, amount, currency, cart, customer)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [orderRef, amountSom, 'KGS', JSON.stringify(cart), JSON.stringify(customer || {})]
+    );
+
     const params = {
       pg_merchant_id: FREEDOM_MERCHANT_ID,
-      pg_order_id: String(order.id),
-      pg_amount: String(order.total_price),
-      pg_currency: order.currency || 'KGS',
-      pg_description: 'Заказ #' + (order.order_number || order.id),
-      pg_salt: salt,
+      pg_order_id: orderRef,
+      pg_amount: amountSom,
+      pg_currency: 'KGS',
+      pg_description: 'Order ' + orderRef,
+      pg_salt: randomSalt(),
       pg_result_url: SERVER_URL + '/freedompay/result',
-      pg_success_url: 'https://' + SHOPIFY_STORE + '/pages/payment-success',
-      pg_failure_url: 'https://' + SHOPIFY_STORE + '/pages/payment-failed',
+      pg_success_url: SERVER_URL + '/freedompay/return?ref=' + encodeURIComponent(orderRef),
+      pg_failure_url: STORE_URL + '/pages/payment-failed',
       pg_language: 'ru',
-      pg_testing_mode: process.env.NODE_ENV === 'production' ? '0' : '1',
+      pg_testing_mode: TESTING_MODE,
     };
-    if (order.email) params.pg_user_contact_email = order.email;
+    if (customer && customer.email) params.pg_user_contact_email = customer.email;
+    if (customer && customer.phone) params.pg_user_phone = String(customer.phone).replace(/\D/g, '');
     params.pg_sig = generateSig('init_payment.php', params, FREEDOM_SECRET_KEY);
-    const fpRes = await axios.post(
-      FREEDOM_BASE_URL + '/init_payment.php',
-      new URLSearchParams(params).toString(),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
-    const redirectMatch = fpRes.data.match(/<pg_redirect_url>(.*?)<\/pg_redirect_url>/);
-    if (redirectMatch) {
-      const payUrl = redirectMatch[1];
-      console.log('Freedom Pay URL for order', order.id, ':', payUrl);
-      await axios.put(
-        'https://' + SHOPIFY_STORE + '/admin/api/2024-01/orders/' + order.id + '.json',
-        { order: { id: order.id, note: 'FREEDOM_PAY_URL: ' + payUrl } },
-        { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } }
-      );
-    } else {
-      console.error('No redirect URL from Freedom Pay:', fpRes.data);
+
+    const data = await fpInitPayment(params);
+    const redirect = (data.match(/<pg_redirect_url>(.*?)<\/pg_redirect_url>/) || [])[1];
+    if (!redirect) {
+      console.error('No redirect from FP:', data);
+      return res.status(502).json({ error: 'Payment init failed' });
     }
+    res.json({ redirect_url: redirect, order_ref: orderRef });
   } catch (err) {
-    console.error('order-created error:', err.message);
+    console.error('pay/start error:', err.message);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Получить ссылку на оплату для заказа
-app.get('/shopify/pay-url/:orderId', async (req, res) => {
+// --- 2) Серверный коллбэк от Freedom Pay (создаёт заказ как paid) ---
+app.post('/freedompay/result', async (req, res) => {
   try {
-    const { orderId } = req.params;
-    const orderRes = await axios.get(
-      'https://' + SHOPIFY_STORE + '/admin/api/2024-01/orders/' + orderId + '.json',
-      { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN } }
-    );
-    const note = orderRes.data.order.note || '';
-    const match = note.match(/FREEDOM_PAY_URL: (https?:\/\/\S+)/);
-    if (match) {
-      res.json({ url: match[1] });
-    } else {
-      res.status(404).json({ error: 'URL not found yet' });
+    const params = { ...req.body };
+    const receivedSig = params.pg_sig;
+    delete params.pg_sig;
+    const expected = generateSig('result', params, FREEDOM_SECRET_KEY);
+    if (receivedSig !== expected) {
+      console.error('Invalid signature on result');
+      return res.type('xml').send('<?xml version="1.0" encoding="UTF-8"?><response><pg_status>error</pg_status><pg_description>Invalid signature</pg_description></response>');
     }
+
+    const orderRef = params.pg_order_id;
+    const paid = params.pg_result === '1' || params.pg_status === 'ok';
+    console.log('FP result for', orderRef, 'paid=', paid);
+
+    if (paid) {
+      const { rows } = await pool.query('SELECT * FROM payments WHERE order_ref=$1', [orderRef]);
+      const rec = rows[0];
+      if (rec && rec.status !== 'paid') {
+        await createShopifyOrder(rec, params.pg_payment_id);
+        await pool.query('UPDATE payments SET status=$1 WHERE order_ref=$2', ['paid', orderRef]);
+      }
+    }
+    res.type('xml').send('<?xml version="1.0" encoding="UTF-8"?><response><pg_status>ok</pg_status></response>');
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('result error:', err.message);
+    res.type('xml').send('<?xml version="1.0" encoding="UTF-8"?><response><pg_status>error</pg_status></response>');
   }
 });
+
+// --- 3) Возврат покупателя после оплаты ---
+app.get('/freedompay/return', (req, res) => {
+  res.redirect(STORE_URL + '/pages/payment-success');
+});
+
+// --- Создание заказа в Shopify как оплаченного ---
+async function createShopifyOrder(rec, paymentId) {
+  const cart = rec.cart;
+  const c = rec.customer || {};
+  const line_items = cart.items.map(i => ({
+    variant_id: i.variant_id || i.id,
+    quantity: i.quantity,
+  }));
+  const orderPayload = {
+    order: {
+      line_items,
+      financial_status: 'paid',
+      currency: 'KGS',
+      email: c.email || undefined,
+      phone: c.phone || undefined,
+      tags: 'FreedomPay',
+      note: 'FreedomPay payment_id: ' + paymentId + ' / ref: ' + rec.order_ref,
+      shipping_address: c.address ? {
+        first_name: c.first_name || '',
+        last_name: c.last_name || '',
+        address1: c.address || '',
+        city: c.city || '',
+        phone: c.phone || '',
+        country: c.country || 'Kyrgyzstan',
+      } : undefined,
+      transactions: [{ kind: 'sale', status: 'success', amount: rec.amount, gateway: 'Freedom Pay' }],
+    },
+  };
+  const r = await axios.post(
+    'https://' + SHOPIFY_STORE + '/admin/api/2024-01/orders.json',
+    orderPayload,
+    { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' }, timeout: 10000 }
+  );
+  console.log('Shopify order created:', r.data.order && r.data.order.id);
+  return r.data.order;
+}
+
 app.get('/', (req, res) => res.json({ status: 'Freedom Pay server running', merchant_id: FREEDOM_MERCHANT_ID }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Server started on port ' + PORT));
-
-app.listen(PORT, () => console.log('Server started on port ' + PORT));
-
-module.exports = app;
-
+initDb()
+  .then(() => app.listen(PORT, () => console.log('Server started on port ' + PORT)))
+  .catch(err => { console.error('DB init failed:', err.message); process.exit(1); });
