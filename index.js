@@ -116,6 +116,75 @@ app.get('/auth/callback', async (req, res) => {
               res.status(500).send('Error: ' + err.message + ' | ' + JSON.stringify(err.response && err.response.data));
       }
 });
+// Webhook от Shopify — новый заказ
+app.post('/shopify/order-created', async (req, res) => {
+  res.status(200).json({ ok: true }); // отвечаем сразу чтобы Shopify не повторял
+  try {
+    const order = req.body;
+    if (!order || !order.id) return;
+    const gateway = (order.gateway || order.payment_gateway || '').toLowerCase();
+    if (!gateway.includes('freedom') && !gateway.includes('manual') && gateway !== '') {
+      console.log('Skip order', order.id, '- gateway:', gateway);
+      return;
+    }
+    console.log('New Freedom Pay order:', order.id, 'gateway:', gateway);
+    const salt = randomSalt();
+    const params = {
+      pg_merchant_id: FREEDOM_MERCHANT_ID,
+      pg_order_id: String(order.id),
+      pg_amount: String(order.total_price),
+      pg_currency: order.currency || 'KGS',
+      pg_description: 'Заказ #' + (order.order_number || order.id),
+      pg_salt: salt,
+      pg_result_url: SERVER_URL + '/freedompay/result',
+      pg_success_url: 'https://' + SHOPIFY_STORE + '/pages/payment-success',
+      pg_failure_url: 'https://' + SHOPIFY_STORE + '/pages/payment-failed',
+      pg_language: 'ru',
+      pg_testing_mode: process.env.NODE_ENV === 'production' ? '0' : '1',
+    };
+    if (order.email) params.pg_user_contact_email = order.email;
+    params.pg_sig = generateSig('init_payment.php', params, FREEDOM_SECRET_KEY);
+    const fpRes = await axios.post(
+      FREEDOM_BASE_URL + '/init_payment.php',
+      new URLSearchParams(params).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    const redirectMatch = fpRes.data.match(/<pg_redirect_url>(.*?)<\/pg_redirect_url>/);
+    if (redirectMatch) {
+      const payUrl = redirectMatch[1];
+      console.log('Freedom Pay URL for order', order.id, ':', payUrl);
+      await axios.put(
+        'https://' + SHOPIFY_STORE + '/admin/api/2024-01/orders/' + order.id + '.json',
+        { order: { id: order.id, note: 'FREEDOM_PAY_URL: ' + payUrl } },
+        { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+      );
+    } else {
+      console.error('No redirect URL from Freedom Pay:', fpRes.data);
+    }
+  } catch (err) {
+    console.error('order-created error:', err.message);
+  }
+});
+
+// Получить ссылку на оплату для заказа
+app.get('/shopify/pay-url/:orderId', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const orderRes = await axios.get(
+      'https://' + SHOPIFY_STORE + '/admin/api/2024-01/orders/' + orderId + '.json',
+      { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN } }
+    );
+    const note = orderRes.data.order.note || '';
+    const match = note.match(/FREEDOM_PAY_URL: (https?:\/\/\S+)/);
+    if (match) {
+      res.json({ url: match[1] });
+    } else {
+      res.status(404).json({ error: 'URL not found yet' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 app.get('/', (req, res) => res.json({ status: 'Freedom Pay server running', merchant_id: FREEDOM_MERCHANT_ID }));
 
 const PORT = process.env.PORT || 3000;
