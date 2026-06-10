@@ -139,7 +139,6 @@ app.post('/freedompay/result', async (req, res) => {
     console.log('Payment result - order:', pg_order_id, '| result:', pg_result, '| payment_id:', pg_payment_id);if (String(pg_result) === '1') {
   await confirmShopifyOrder(pg_order_id, pg_payment_id);
 }
-    }
     res.type('xml').send('<?xml version="1.0" encoding="UTF-8"?><response><pg_status>ok</pg_status></response>');
   } catch (err) {
     console.error('Result webhook error:', err.message);
