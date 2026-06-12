@@ -75,21 +75,33 @@ async function lookupDiscount(code) {
   // with a query filter silently ignores the filter and returns the first node,
   // which made every code resolve to the same discount.)
   const query = `query($code: String!) {
-    codeDiscountNodeByCode(code: $code) {
-      codeDiscount {
-        __typename
-        ... on DiscountCodeBasic {
-          title
-          status
-          customerGets { value {
+  codeDiscountNodeByCode(code: $code) {
+    codeDiscount {
+      __typename
+      ... on DiscountCodeBasic {
+        title
+        status
+        appliesOncePerCustomer
+        usageLimit
+        customerGets {
+          value {
             __typename
             ... on DiscountPercentage { percentage }
             ... on DiscountAmount { amount { amount currencyCode } }
-          } }
+          }
+          items {
+            __typename
+            ... on DiscountProducts {
+              products(first: 100) { nodes { id } }
+              productVariants(first: 100) { nodes { id } }
+            }
+            ... on AllDiscountItems { allItems }
+          }
         }
       }
     }
-  }`;
+  }
+}`;
   let gql;
   try {
     gql = await axios.post(
@@ -109,30 +121,65 @@ async function lookupDiscount(code) {
   const disc = node && node.codeDiscount;
   if (!disc) return { ok: false, error: 'Промокод не найден' };
   if (disc.status && disc.status !== 'ACTIVE') return { ok: false, error: 'Промокод неактивен' };
-  const value = disc.customerGets && disc.customerGets.value;
-  if (value && value.__typename === 'DiscountPercentage') {
-    return { ok: true, type: 'percentage', percentage: Number(value.percentage) || 0, title: disc.title || '' };
-  }
-  if (value && value.__typename === 'DiscountAmount') {
-    return { ok: true, type: 'amount', amount: Number(value.amount && value.amount.amount) || 0, currency: (value.amount && value.amount.currencyCode) || 'KGS', title: disc.title || '' };
-  }
+  const itemsNode = disc.customerGets && disc.customerGets.items;
+let scope = { all: true, productIds: [], variantIds: [] };
+if (itemsNode && itemsNode.__typename === 'DiscountProducts') {
+  scope = {
+    all: false,
+    productIds: (itemsNode.products && itemsNode.products.nodes || []).map(n => n.id),
+    variantIds: (itemsNode.productVariants && itemsNode.productVariants.nodes || []).map(n => n.id)
+  };
+}
+const base = { ok: true, title: disc.title || '', scope,
+  oncePerCustomer: !!disc.appliesOncePerCustomer, usageLimit: disc.usageLimit || null };
+
+if (value && value.__typename === 'DiscountPercentage') {
+  return Object.assign({}, base, { type: 'percentage', percentage: Number(value.percentage) || 0 });
+}
+if (value && value.__typename === 'DiscountAmount') {
+  return Object.assign({}, base, { type: 'amount',
+    amount: Number(value.amount && value.amount.amount) || 0,
+    currency: (value.amount && value.amount.currencyCode) || 'KGS' });
+}
+return { ok: false, error: 'Тип скидки не поддерживается' };
   return { ok: false, error: 'Тип скидки не поддерживается' };
 }
 
 app.post('/discount/validate', async (req, res) => {
   try {
-    const { code, cart_total } = req.body;
+    const { code, cart_total, items } = req.body;
     if (!code) return res.json({ valid: false, error: 'Код не указан' });
     const d = await lookupDiscount(String(code).trim());
     if (!d.ok) return res.json({ valid: false, error: d.error });
+
     const total = Number(cart_total) || 0;
+    const list = Array.isArray(items) ? items : [];
+
+    // Сумма позиций, на которые распространяется скидка
+    let eligible = total;
+    if (!d.scope.all && list.length) {
+      const pIds = d.scope.productIds.map(gidNum);
+      const vIds = d.scope.variantIds.map(gidNum);
+      eligible = list.reduce((sum, it) => {
+        const pid = String(it.product_id || '');
+        const vid = String(it.variant_id || '');
+        const match = vIds.includes(vid) || pIds.includes(pid);
+        return match ? sum + (Number(it.line_total) || 0) : sum;
+      }, 0);
+    }
+
+    if (!d.scope.all && eligible <= 0) {
+      return res.json({ valid: false, error: 'Промокод действует только на определённые товары' });
+    }
+
     let newTotal = total, summary = 'Промокод применён', currency = 'KGS';
     if (d.type === 'percentage') {
-      newTotal = Math.round(total * (1 - d.percentage));
-      summary = 'Скидка ' + Math.round(d.percentage * 100) + '%';
+      const discountAmt = Math.round(eligible * (d.percentage / 100));
+      newTotal = Math.max(0, total - discountAmt);
+      summary = 'Скидка ' + Math.round(d.percentage * 100) / 100 + '%';
     } else if (d.type === 'amount') {
       currency = d.currency;
-      newTotal = Math.max(0, total - d.amount);
+      newTotal = Math.max(0, total - Math.min(d.amount, eligible));
       summary = 'Скидка ' + d.amount + ' ' + currency;
     }
     res.json({ valid: true, summary, new_total: newTotal, currency });
@@ -197,9 +244,14 @@ app.post('/order/create', async (req, res) => {
     });
     res.json({ redirect_url: result.redirect_url, order_ref: String(orderId) });
   } catch (err) {
-    console.error('Order create error:', err.message, err.response && JSON.stringify(err.response.data));
-    res.status(500).json({ error: 'Order creation failed' });
+  const data = err.response && err.response.data;
+  console.error('Order create error:', err.message, data && JSON.stringify(data));
+  const blob = data ? JSON.stringify(data).toLowerCase() : '';
+  if (/discount|usage|limit|used|применен|использов/.test(blob)) {
+    return res.status(422).json({ error: 'Промокод уже использован или достиг лимита применения', code: 'DISCOUNT_ERROR' });
   }
+  res.status(500).json({ error: 'Order creation failed' });
+}
 });
 
 app.post('/freedompay/create', async (req, res) => {
