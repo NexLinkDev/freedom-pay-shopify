@@ -173,21 +173,17 @@ app.post('/discount/validate', async (req, res) => {
       return res.json({ valid: false, error: 'Промокод действует только на определённые товары' });
     }
 
-    let newTotal = total, summary = 'Промокод применён', currency = 'KGS';
-    if (d.type === 'percentage') {
-      const discountAmt = Math.round(eligible * (d.percentage / 100));
-      newTotal = Math.max(0, total - discountAmt);
-      summary = 'Скидка ' + Math.round(d.percentage * 100) / 100 + '%';
-    } else if (d.type === 'amount') {
-      currency = d.currency;
-      newTotal = Math.max(0, total - Math.min(d.amount, eligible));
-      summary = 'Скидка ' + d.amount + ' ' + currency;
-    }
-    res.json({ valid: true, summary, new_total: newTotal, currency });
-  } catch (err) {
-    console.error('Discount validate error:', err.message, err.response && JSON.stringify(err.response.data));
-    res.status(500).json({ valid: false, error: 'Ошибка проверки промокода' });
-  }
+   let newTotal = total, summary = 'Промокод применён', currency = 'KGS';
+if (d.type === 'percentage') {
+  const discountAmt = Math.round(eligible * d.percentage);   // 0.1 — это уже доля, без /100
+  newTotal = Math.max(0, total - discountAmt);
+  summary = 'Скидка ' + Math.round(d.percentage * 100) + '%'; // *100 только для текста
+} else if (d.type === 'amount') {
+  currency = d.currency;
+  newTotal = Math.max(0, total - Math.min(d.amount, eligible));
+  summary = 'Скидка ' + d.amount + ' ' + currency;
+}
+res.json({ valid: true, summary, new_total: newTotal, currency });
 });
 
 app.post('/order/create', async (req, res) => {
