@@ -322,3 +322,90 @@ app.get('/', (req, res) => res.json({ status: 'Freedom Pay server running', merc
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Server on', PORT));
+
+
+// ===== Kompanion QR acquiring =====
+const { Pool } = require('pg');
+const KOMPANION_BASE_URL = process.env.KOMPANION_BASE_URL || 'https://partner-qr-backend.kompanion.kg';
+const KOMPANION_MERCHANT_ID = process.env.KOMPANION_MERCHANT_ID;
+const KOMPANION_API_KEY = process.env.KOMPANION_API_KEY;
+const KOMPANION_SECRET = process.env.KOMPANION_SECRET;
+const pgPool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
+async function kpInitDb() {
+  if (!pgPool) { console.warn('DATABASE_URL not set, Kompanion QR amount store disabled'); return; }
+  try {
+    await pgPool.query('CREATE TABLE IF NOT EXISTS kompanion_orders (txn_id TEXT PRIMARY KEY, amount BIGINT NOT NULL, status TEXT DEFAULT \'PENDING\', created_at TIMESTAMPTZ DEFAULT now())');
+  } catch (e) { console.error('kpInitDb error:', e.message); }
+}
+kpInitDb();
+function kompanionSign(txnId, amountTyiyn) {
+  const base = String(KOMPANION_MERCHANT_ID) + String(txnId) + String(amountTyiyn) + String(KOMPANION_SECRET);
+  return crypto.createHash('sha256').update(base).digest('hex');
+}
+async function kompanionCreateOrder({ order_id, amountSom, purpose, description, return_url }) {
+  const txnId = String(order_id);
+  const amount = Math.round(Number(amountSom) * 100);
+  const body = { externalId: txnId, amount: amount, purpose: purpose || ('Oplata zakaza #' + order_id), returnUrl: return_url, sign: kompanionSign(txnId, amount) };
+  if (description) body.description = description;
+  if (pgPool) { try { await pgPool.query('INSERT INTO kompanion_orders (txn_id, amount) VALUES ($1,$2) ON CONFLICT (txn_id) DO UPDATE SET amount = EXCLUDED.amount', [txnId, amount]); } catch (e) { console.error('kompanion store error:', e.message); } }
+  const resp = await axios.post(KOMPANION_BASE_URL + '/merchant/order', body, { headers: { 'X-Merchant-Id': KOMPANION_MERCHANT_ID, 'X-Api-Key': KOMPANION_API_KEY, 'Accept': 'application/json', 'Content-Type': 'application/json' }, timeout: 10000 });
+  return { redirect_url: resp.data.paymentUrl, txn_id: resp.data.txnId };
+}
+
+app.post('/order/create-qr', async (req, res) => {
+  try {
+    const { items, customer, address, note, discount_code } = req.body;
+    if (!items || !items.length) return res.status(400).json({ error: 'Cart is empty' });
+    if (!customer || !customer.name || !customer.phone || !customer.email) {
+      return res.status(400).json({ error: 'Name, phone and email required' });
+    }
+    const draftBody = {
+      draft_order: {
+        line_items: items.map(i => ({ variant_id: i.variant_id, quantity: i.quantity })),
+        note: note || '',
+        email: customer.email,
+        shipping_address: { name: customer.name, phone: customer.phone, address1: address || '' },
+        tags: 'kompanion-qr',
+      }
+    };
+    if (discount_code) { try { const __dd = await lookupDiscount(String(discount_code).trim()); if (__dd && __dd.ok) { draftBody.draft_order.applied_discount = (__dd.type === 'percentage') ? { title: __dd.title || String(discount_code), value_type: 'percentage', value: String(__dd.percentage) } : { title: __dd.title || String(discount_code), value_type: 'fixed_amount', value: String(__dd.amount) }; } } catch (e) {} }
+    const draftRes = await axios.post(
+      'https://' + SHOPIFY_STORE + '/admin/api/' + API_VER + '/draft_orders.json',
+      draftBody,
+      { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+      );
+    const draft = draftRes.data.draft_order;
+    const orderId = draft.id;
+    const amount = draft.total_price;
+    const result = await kompanionCreateOrder({
+      order_id: orderId,
+      amountSom: amount,
+      purpose: 'Oplata zakaza #' + orderId,
+      description: 'NFO order',
+      return_url: 'https://' + SHOPIFY_STORE + '/pages/payment-success',
+    });
+    res.json({ redirect_url: result.redirect_url, order_ref: String(orderId) });
+  } catch (err) {
+    const data = err.response && err.response.data;
+    console.error('QR order create error:', err.message, data && JSON.stringify(data));
+    res.status(500).json({ error: 'Order creation failed' });
+  }
+});
+
+app.post('/kompanion/callback', async (req, res) => {
+  try {
+    const { txnId, status, sign } = req.body || {};
+    if (!txnId || !status) return res.status(200).json({ ok: true });
+    let amountTyiyn = null;
+    if (pgPool) { try { const r = await pgPool.query('SELECT amount FROM kompanion_orders WHERE txn_id = $1', [String(txnId)]); if (r.rows && r.rows[0]) amountTyiyn = r.rows[0].amount; } catch (e) { console.error('kompanion lookup error:', e.message); } }
+    if (amountTyiyn === null) { console.error('Kompanion callback: unknown txnId', txnId); return res.status(200).json({ ok: true }); }
+    const expected = kompanionSign(txnId, amountTyiyn);
+    if (String(sign) !== expected) { console.error('Kompanion callback: invalid signature for', txnId); return res.status(403).json({ error: 'invalid signature' }); }
+    if (pgPool) { try { await pgPool.query('UPDATE kompanion_orders SET status = $2 WHERE txn_id = $1', [String(txnId), String(status)]); } catch (e) {} }
+    if (status === 'SUCCESS') { await confirmShopifyOrder(txnId, txnId); }
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('Kompanion callback error:', e.message);
+    return res.status(200).json({ ok: true });
+  }
+});
