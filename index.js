@@ -83,6 +83,11 @@ async function lookupDiscount(code) {
         status
         appliesOncePerCustomer
         usageLimit
+        minimumRequirement {
+          __typename
+            ... on DiscountMinimumSubtotal { greaterThanOrEqualToSubtotal { amount currencyCode } }
+              ... on DiscountMinimumQuantity { greaterThanOrEqualToQuantity }
+              }
         customerGets {
           value {
             __typename
@@ -123,6 +128,13 @@ async function lookupDiscount(code) {
   if (disc.status && disc.status !== 'ACTIVE') return { ok: false, error: 'Промокод неактивен' };
   const itemsNode = disc.customerGets && disc.customerGets.items;
   const value = disc.customerGets && disc.customerGets.value;
+  const minReq = disc.minimumRequirement;
+  let minSubtotal = 0, minQty = 0;
+  if (minReq && minReq.__typename === 'DiscountMinimumSubtotal') {
+      minSubtotal = Number(minReq.greaterThanOrEqualToSubtotal && minReq.greaterThanOrEqualToSubtotal.amount) || 0;
+  } else if (minReq && minReq.__typename === 'DiscountMinimumQuantity') {
+      minQty = Number(minReq.greaterThanOrEqualToQuantity) || 0;
+  }
 let scope = { all: true, productIds: [], variantIds: [] };
 if (itemsNode && itemsNode.__typename === 'DiscountProducts') {
   scope = {
@@ -132,8 +144,7 @@ if (itemsNode && itemsNode.__typename === 'DiscountProducts') {
   };
 }
 const base = { ok: true, title: disc.title || '', scope,
-  oncePerCustomer: !!disc.appliesOncePerCustomer, usageLimit: disc.usageLimit || null };
-
+  oncePerCustomer: !!disc.appliesOncePerCustomer, usageLimit: disc.usageLimit || null, minSubtotal, minQty };
 if (value && value.__typename === 'DiscountPercentage') {
   return Object.assign({}, base, { type: 'percentage', percentage: Number(value.percentage) || 0 });
 }
@@ -155,6 +166,17 @@ app.post('/discount/validate', async (req, res) => {
 
     const total = Number(cart_total) || 0;
     const list = Array.isArray(items) ? items : [];
+
+        // Минимальная сумма заказа из правила скидки Shopify
+        if (d.minSubtotal && total < d.minSubtotal) {
+                return res.json({ valid: false, error: 'Минимальная сумма заказа для промокода — ' + Number(d.minSubtotal).toLocaleString('ru-RU') + ' сом' });
+        }
+        if (d.minQty) {
+                const qty = list.reduce((s, it) => s + (Number(it.quantity) || 0), 0);
+                if (qty && qty < d.minQty) {
+                          return res.json({ valid: false, error: 'Минимум ' + d.minQty + ' товар(ов) для промокода' });
+                }
+        }
 
     // Сумма позиций, на которые распространяется скидка
     let eligible = total;
