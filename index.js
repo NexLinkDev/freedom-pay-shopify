@@ -390,7 +390,7 @@ app.post('/order/create-qr', async (req, res) => {
         tags: 'kompanion-qr',
       }
     };
-    if (discount_code) { try { const __dd = await lookupDiscount(String(discount_code).trim()); if (__dd && __dd.ok) { draftBody.draft_order.applied_discount = (__dd.type === 'percentage') ? { title: __dd.title || String(discount_code), value_type: 'percentage', value: String(__dd.percentage) } : { title: __dd.title || String(discount_code), value_type: 'fixed_amount', value: String(__dd.amount) }; } } catch (e) {} }
+    if (discount_code) { try { const __dd = await lookupDiscount(String(discount_code).trim()); if (__dd && __dd.ok) { draftBody.draft_order.applied_discount = (__dd.type === 'percentage') ? { title: __dd.title || String(discount_code), value_type: 'percentage', value: String((Number(__dd.percentage)||0)*100) } : { title: __dd.title || String(discount_code), value_type: 'fixed_amount', value: String(__dd.amount) }; } } catch (e) {} }
     const draftRes = await axios.post(
       'https://' + SHOPIFY_STORE + '/admin/api/' + API_VER + '/draft_orders.json',
       draftBody,
