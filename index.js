@@ -326,7 +326,7 @@ async function sendOrderToTelegram(orderId) {
       (d.name ? '\n\u0417\u0430\u043a\u0430\u0437: ' + d.name : '') +
       '\n\n\u0422\u043e\u0432\u0430\u0440\u044b:\n' + items +
       '\n\n\u0421\u0443\u043c\u043c\u0430: ' + d.total_price + ' ' + (d.currency||'') +
-      (d.applied_discount ? '\n\u0421\u043a\u0438\u0434\u043a\u0430: ' + d.applied_discount.title + ' (' + d.applied_discount.value + ')' : '') +
+      (d.applied_discount ? '\n\u0421\u043a\u0438\u0434\u043a\u0430: ' + d.applied_discount.title + ' \u2014 ' + (d.applied_discount.value_type === 'percentage' ? (parseFloat(d.applied_discount.value) + '%') : (d.applied_discount.value + ' ' + (d.currency||''))) : '') +
       '\n\n\u041a\u043b\u0438\u0435\u043d\u0442: ' + (addr.name || '') +
       '\n\u0422\u0435\u043b\u0435\u0444\u043e\u043d: ' + (addr.phone || d.phone || '') +
       '\nEmail: ' + (d.email || '') +
