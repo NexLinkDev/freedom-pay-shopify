@@ -37,6 +37,13 @@ function randomSalt() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+function splitName(full) {
+  const parts = String(full || '').trim().split(/\s+/).filter(Boolean);
+  const first_name = parts.shift() || '';
+  const last_name = parts.join(' ');
+  return { first_name, last_name };
+}
+
 async function fpInitPayment({ order_id, amount, currency, description, customer_email, customer_phone }) {
   const params = {
     pg_merchant_id: FREEDOM_MERCHANT_ID,
@@ -222,13 +229,16 @@ app.post('/order/create', async (req, res) => {
       return res.status(400).json({ error: 'Name, phone and email required' });
     }
 
+    const __nm = splitName(customer.name);
     const draftBody = {
       draft_order: {
         line_items: items.map(i => ({ variant_id: i.variant_id, quantity: i.quantity })),
         note: note || '',
         email: customer.email,
+        customer: { first_name: __nm.first_name, last_name: __nm.last_name, email: customer.email },
         shipping_address: {
-          name: customer.name,
+          first_name: __nm.first_name,
+          last_name: __nm.last_name,
           phone: customer.phone,
           address1: address || '',
         },
@@ -413,12 +423,14 @@ app.post('/order/create-qr', async (req, res) => {
     if (!customer || !customer.name || !customer.phone || !customer.email) {
       return res.status(400).json({ error: 'Name, phone and email required' });
     }
+    const __nm = splitName(customer.name);
     const draftBody = {
       draft_order: {
         line_items: items.map(i => ({ variant_id: i.variant_id, quantity: i.quantity })),
         note: note || '',
         email: customer.email,
-        shipping_address: { name: customer.name, phone: customer.phone, address1: address || '' },
+        customer: { first_name: __nm.first_name, last_name: __nm.last_name, email: customer.email },
+        shipping_address: { first_name: __nm.first_name, last_name: __nm.last_name, phone: customer.phone, address1: address || '' },
         tags: 'kompanion-qr',
       }
     };
