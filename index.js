@@ -408,9 +408,13 @@ function kompanionSign(txnId, amountTyiyn) {
 }
 async function kompanionCreateOrder({ order_id, amountSom, purpose, description, return_url }) {
   const txnId = String(order_id);
-  const amount = Math.round(Number(amountSom) * 100);
-  const body = { externalId: txnId, amount: amount, purpose: purpose || ('Oplata zakaza ' + order_id), returnUrl: return_url, sign: kompanionSign(txnId, amount) };
+  // защита от float-погрешности: строка "4.00" -> 400 тыйын, без 3999.9999
+  const amount = Math.round((Number(amountSom) + Number.EPSILON) * 100);
+  const sign = kompanionSign(txnId, amount);
+  const body = { externalId: txnId, amount: amount, purpose: purpose || ('Oplata zakaza ' + order_id), returnUrl: return_url, sign };
   if (description) body.description = description;
+  // ВРЕМЕННЫЙ лог для диагностики (секрет НЕ логируем)
+  console.log('KOMPANION REQ:', JSON.stringify({ merchantId: KOMPANION_MERCHANT_ID, externalId: txnId, amount, signPrefix: sign.slice(0, 12) }));
   if (pgPool) { try { await pgPool.query('INSERT INTO kompanion_orders (txn_id, amount) VALUES ($1,$2) ON CONFLICT (txn_id) DO UPDATE SET amount = EXCLUDED.amount', [txnId, amount]); } catch (e) { console.error('kompanion store error:', e.message); } }
   const resp = await axios.post(KOMPANION_BASE_URL + '/merchant/order', body, { headers: { 'X-Merchant-Id': KOMPANION_MERCHANT_ID, 'X-Api-Key': KOMPANION_API_KEY, 'Accept': 'application/json', 'Content-Type': 'application/json' }, timeout: 10000 });
   return { redirect_url: resp.data.paymentUrl, txn_id: resp.data.txnId };
@@ -452,8 +456,9 @@ app.post('/order/create-qr', async (req, res) => {
     });
     res.json({ redirect_url: result.redirect_url, order_ref: String(orderId) });
   } catch (err) {
+    const status = err.response && err.response.status;
     const data = err.response && err.response.data;
-    console.error('QR order create error:', err.message, data && JSON.stringify(data));
+    console.error('KOMPANION ERR:', status, err.message, data && JSON.stringify(data));
     res.status(500).json({ error: 'Order creation failed' });
   }
 });
