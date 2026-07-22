@@ -446,7 +446,7 @@ app.post('/order/create-qr', async (req, res) => {
     const result = await kompanionCreateOrder({
       order_id: orderId,
       amountSom: amount,
-      purpose: 'Oplata zakaza #' + orderId,
+      purpose: 'Oplata zakaza ' + orderId,
       description: 'NFO order',
       return_url: 'https://' + SHOPIFY_STORE + '/pages/payment-success',
     });
