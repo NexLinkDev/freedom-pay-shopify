@@ -409,7 +409,7 @@ function kompanionSign(txnId, amountTyiyn) {
 async function kompanionCreateOrder({ order_id, amountSom, purpose, description, return_url }) {
   const txnId = String(order_id);
   const amount = Math.round(Number(amountSom) * 100);
-  const body = { externalId: txnId, amount: amount, purpose: purpose || ('Oplata zakaza #' + order_id), returnUrl: return_url, sign: kompanionSign(txnId, amount) };
+  const body = { externalId: txnId, amount: amount, purpose: purpose || ('Oplata zakaza ' + order_id), returnUrl: return_url, sign: kompanionSign(txnId, amount) };
   if (description) body.description = description;
   if (pgPool) { try { await pgPool.query('INSERT INTO kompanion_orders (txn_id, amount) VALUES ($1,$2) ON CONFLICT (txn_id) DO UPDATE SET amount = EXCLUDED.amount', [txnId, amount]); } catch (e) { console.error('kompanion store error:', e.message); } }
   const resp = await axios.post(KOMPANION_BASE_URL + '/merchant/order', body, { headers: { 'X-Merchant-Id': KOMPANION_MERCHANT_ID, 'X-Api-Key': KOMPANION_API_KEY, 'Accept': 'application/json', 'Content-Type': 'application/json' }, timeout: 10000 });
