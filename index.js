@@ -179,6 +179,14 @@ if (value && value.__typename === 'DiscountAmount') {
 
 // ===== Скидки: общие хелперы =====
 
+// Русское склонение: 1 товар, 2 товара, 5 товаров.
+function pluralRu(n, one, few, many) {
+  const m10 = n % 10, m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return few;
+  return many;
+}
+
 // Суммарное количество единиц товара в корзине.
 function cartQty(items) {
   return (Array.isArray(items) ? items : []).reduce((s, it) => s + (Number(it.quantity) || 0), 0);
