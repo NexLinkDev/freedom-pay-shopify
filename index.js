@@ -24,6 +24,18 @@ const API_VER = '2024-01';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
+// ===== Автоскидка (без промокода) =====
+// Важно: Shopify Automatic Discounts НЕ применяются к draft_orders, поэтому логика живёт здесь.
+// Несуммируемость гарантирована тем, что у draft order есть ровно одно поле applied_discount,
+// и resolveDiscount() всегда выбирает только ОДНУ скидку.
+const AUTO_DISCOUNT_ENABLED   = String(process.env.AUTO_DISCOUNT_ENABLED || 'true').toLowerCase() !== 'false';
+const AUTO_DISCOUNT_TITLE     = process.env.AUTO_DISCOUNT_TITLE || 'Скидка за 2 товара';
+const AUTO_DISCOUNT_TYPE      = String(process.env.AUTO_DISCOUNT_TYPE || 'percentage').toLowerCase(); // 'percentage' | 'amount'
+const AUTO_DISCOUNT_VALUE     = Number(process.env.AUTO_DISCOUNT_VALUE || 10);   // 10 => 10% либо 10 сом
+const AUTO_DISCOUNT_MIN_QTY   = Number(process.env.AUTO_DISCOUNT_MIN_QTY || 2);  // СУММАРНОЕ кол-во единиц в корзине
+const AUTO_DISCOUNT_MIN_TOTAL = Number(process.env.AUTO_DISCOUNT_MIN_TOTAL || 0); // 0 = без ограничения
+const AUTO_DISCOUNT_CURRENCY  = process.env.AUTO_DISCOUNT_CURRENCY || 'KGS';
+
 function generateSig(scriptName, params, secretKey) {
   const sorted = Object.keys(params).sort().reduce((acc, key) => {
     acc[key] = params[key];
@@ -162,62 +174,171 @@ if (value && value.__typename === 'DiscountAmount') {
     amount: Number(value.amount && value.amount.amount) || 0,
     currency: (value.amount && value.amount.currencyCode) || 'KGS' });
 }
-return { ok: false, error: 'Тип скидки не поддерживается' };
   return { ok: false, error: 'Тип скидки не поддерживается' };
+}
+
+// ===== Скидки: общие хелперы =====
+
+// Суммарное количество единиц товара в корзине.
+function cartQty(items) {
+  return (Array.isArray(items) ? items : []).reduce((s, it) => s + (Number(it.quantity) || 0), 0);
+}
+
+// Сумма корзины: из line_total, или fallback из cart_total. 0 = неизвестно.
+function cartTotalOf(items, fallback) {
+  const sum = (Array.isArray(items) ? items : []).reduce((s, it) => s + (Number(it.line_total) || 0), 0);
+  return sum > 0 ? sum : (Number(fallback) || 0);
+}
+
+// Автоскидка: возвращает дескриптор того же вида, что lookupDiscount(), или null.
+function getAutoDiscount(items, cartTotal) {
+  if (!AUTO_DISCOUNT_ENABLED) return null;
+  if (!(AUTO_DISCOUNT_VALUE > 0)) return null;
+  if (cartQty(items) < AUTO_DISCOUNT_MIN_QTY) return null;
+  const total = cartTotalOf(items, cartTotal);
+  if (AUTO_DISCOUNT_MIN_TOTAL > 0 && total > 0 && total < AUTO_DISCOUNT_MIN_TOTAL) return null;
+  const base = {
+    ok: true, auto: true, code: null, title: AUTO_DISCOUNT_TITLE,
+    scope: { all: true, productIds: [], variantIds: [] },
+    oncePerCustomer: false, usageLimit: null, minSubtotal: 0, minQty: AUTO_DISCOUNT_MIN_QTY
+  };
+  if (AUTO_DISCOUNT_TYPE === 'amount' || AUTO_DISCOUNT_TYPE === 'fixed_amount') {
+    return Object.assign(base, { type: 'amount', amount: AUTO_DISCOUNT_VALUE, currency: AUTO_DISCOUNT_CURRENCY });
+  }
+  return Object.assign(base, { type: 'percentage', percentage: AUTO_DISCOUNT_VALUE / 100 });
+}
+
+// Считает сумму скидки и итог для любого дескриптора скидки.
+function computeDiscount(d, cartTotal, items) {
+  const total = Number(cartTotal) || 0;
+  const list = Array.isArray(items) ? items : [];
+  let eligible = total;
+  if (d.scope && !d.scope.all && list.length) {
+    const pIds = (d.scope.productIds || []).map(gidNum);
+    const vIds = (d.scope.variantIds || []).map(gidNum);
+    eligible = list.reduce((sum, it) => {
+      const pid = String(it.product_id || '');
+      const vid = String(it.variant_id || '');
+      return (vIds.includes(vid) || pIds.includes(pid)) ? sum + (Number(it.line_total) || 0) : sum;
+    }, 0);
+  }
+  if (d.scope && !d.scope.all && eligible <= 0) {
+    return { error: 'Промокод действует только на определённые товары' };
+  }
+  const label = d.auto ? (d.title || AUTO_DISCOUNT_TITLE) : 'Скидка';
+  let currency = 'KGS', discountAmt = 0, summary = '';
+  if (d.type === 'percentage') {
+    discountAmt = Math.round(eligible * (Number(d.percentage) || 0));  // percentage — уже доля (0.1)
+    summary = label + ' ' + Math.round((Number(d.percentage) || 0) * 100) + '%';
+  } else if (d.type === 'amount') {
+    currency = d.currency || AUTO_DISCOUNT_CURRENCY;
+    discountAmt = Math.min(Number(d.amount) || 0, eligible);
+    summary = label + ' ' + discountAmt + ' ' + currency;
+  } else {
+    return { error: 'Тип скидки не поддерживается' };
+  }
+  return { eligible, discountAmt, new_total: Math.max(0, total - discountAmt), summary, currency };
+}
+
+// ЕДИНАЯ точка принятия решения: к заказу применяется РОВНО ОДНА скидка.
+// Автоскидка приоритетна; ручной промокод при активной автоскидке отклоняется.
+async function resolveDiscount({ items, cart_total, code }) {
+  const auto = getAutoDiscount(items, cart_total);
+  const manual = String(code || '').trim();
+  if (auto) {
+    if (manual) {
+      return {
+        discount: auto,
+        rejectedCode: manual,
+        error: (auto.title || AUTO_DISCOUNT_TITLE) + ' уже применена автоматически. Скидки не суммируются — промокод «' + manual + '» применить нельзя.'
+      };
+    }
+    return { discount: auto };
+  }
+  if (!manual) return { discount: null };
+  const d = await lookupDiscount(manual);
+  if (!d.ok) return { discount: null, error: d.error };
+  const total = cartTotalOf(items, cart_total);
+  if (d.minSubtotal && total > 0 && total < d.minSubtotal) {
+    return { discount: null, error: 'Минимальная сумма заказа для промокода — ' + Number(d.minSubtotal).toLocaleString('ru-RU') + ' сом' };
+  }
+  if (d.minQty) {
+    const qty = cartQty(items);
+    if (qty && qty < d.minQty) {
+      return { discount: null, error: 'Минимум ' + d.minQty + ' товар(ов) для промокода' };
+    }
+  }
+  return { discount: Object.assign({}, d, { auto: false, code: manual }) };
+}
+
+// Перевод дескриптора в draft_order.applied_discount (оно всегда одно → не суммируется).
+function appliedDiscountPayload(d) {
+  if (!d) return null;
+  const title = d.title || d.code || 'Скидка';
+  const description = d.auto ? 'AUTO:' + AUTO_DISCOUNT_MIN_QTY + '+' : (d.code || title);
+  if (d.type === 'percentage') {
+    return { title, value_type: 'percentage', value: String((Number(d.percentage) || 0) * 100), description };
+  }
+  return { title, value_type: 'fixed_amount', value: String(Number(d.amount) || 0), description };
 }
 
 app.post('/discount/validate', async (req, res) => {
   try {
     const { code, cart_total, items } = req.body;
     if (!code) return res.json({ valid: false, error: 'Код не указан' });
-    const d = await lookupDiscount(String(code).trim());
-    if (!d.ok) return res.json({ valid: false, error: d.error });
-
     const total = Number(cart_total) || 0;
-    const list = Array.isArray(items) ? items : [];
 
-        // Минимальная сумма заказа из правила скидки Shopify
-        if (d.minSubtotal && total < d.minSubtotal) {
-                return res.json({ valid: false, error: 'Минимальная сумма заказа для промокода — ' + Number(d.minSubtotal).toLocaleString('ru-RU') + ' сом' });
-        }
-        if (d.minQty) {
-                const qty = list.reduce((s, it) => s + (Number(it.quantity) || 0), 0);
-                if (qty && qty < d.minQty) {
-                          return res.json({ valid: false, error: 'Минимум ' + d.minQty + ' товар(ов) для промокода' });
-                }
-        }
+    const r = await resolveDiscount({ items, cart_total: total, code });
 
-    // Сумма позиций, на которые распространяется скидка
-    let eligible = total;
-    if (!d.scope.all && list.length) {
-      const pIds = d.scope.productIds.map(gidNum);
-      const vIds = d.scope.variantIds.map(gidNum);
-      eligible = list.reduce((sum, it) => {
-        const pid = String(it.product_id || '');
-        const vid = String(it.variant_id || '');
-        const match = vIds.includes(vid) || pIds.includes(pid);
-        return match ? sum + (Number(it.line_total) || 0) : sum;
-      }, 0);
+    // Автоскидка активна → ручной промокод не применяем (скидки не суммируются).
+    if (r.rejectedCode) {
+      const a = computeDiscount(r.discount, total, items);
+      return res.json({
+        valid: false, error: r.error,
+        auto_applied: true, auto_title: r.discount.title,
+        summary: a.summary, discount: a.discountAmt, new_total: a.new_total, currency: a.currency
+      });
     }
 
-    if (!d.scope.all && eligible <= 0) {
-      return res.json({ valid: false, error: 'Промокод действует только на определённые товары' });
-    }
+    if (!r.discount) return res.json({ valid: false, error: r.error || 'Промокод не найден' });
 
-   let newTotal = total, summary = 'Промокод применён', currency = 'KGS';
-    if (d.type === 'percentage') {
-      const discountAmt = Math.round(eligible * d.percentage);   // 0.1 — уже доля, без /100
-      newTotal = Math.max(0, total - discountAmt);
-      summary = 'Скидка ' + Math.round(d.percentage * 100) + '%'; // *100 только для текста
-    } else if (d.type === 'amount') {
-      currency = d.currency;
-      newTotal = Math.max(0, total - Math.min(d.amount, eligible));
-      summary = 'Скидка ' + d.amount + ' ' + currency;
-    }
-    res.json({ valid: true, summary, new_total: newTotal, currency });
+    const c = computeDiscount(r.discount, total, items);
+    if (c.error) return res.json({ valid: false, error: c.error });
+    res.json({ valid: true, summary: c.summary, discount: c.discountAmt, new_total: c.new_total, currency: c.currency });
   } catch (e) {
     console.error('Discount validate error:', e.message, e.stack);
     return res.status(500).json({ valid: false, error: 'Ошибка проверки промокода' });
+  }
+});
+
+// Автоскидка: фронт вызывает при любом изменении корзины.
+// { items: [{ variant_id, product_id, quantity, line_total }], cart_total }
+app.post('/discount/auto', async (req, res) => {
+  try {
+    const { cart_total, items } = req.body || {};
+    const total = Number(cart_total) || 0;
+    const auto = getAutoDiscount(items, total);
+    if (!auto) {
+      const need = Math.max(0, AUTO_DISCOUNT_MIN_QTY - cartQty(items));
+      return res.json({
+        applied: false, enabled: AUTO_DISCOUNT_ENABLED, min_qty: AUTO_DISCOUNT_MIN_QTY,
+        new_total: total,
+        hint: (AUTO_DISCOUNT_ENABLED && need > 0)
+          ? ('Добавьте ещё ' + need + ' товар(ов) — скидка применится автоматически')
+          : null
+      });
+    }
+    const c = computeDiscount(auto, total, items);
+    if (c.error) return res.json({ applied: false, enabled: true, min_qty: AUTO_DISCOUNT_MIN_QTY, new_total: total });
+    res.json({
+      applied: true, exclusive: true, title: auto.title, summary: c.summary,
+      discount: c.discountAmt, new_total: c.new_total, currency: c.currency,
+      min_qty: AUTO_DISCOUNT_MIN_QTY,
+      notice: 'Скидка применена автоматически и не суммируется с промокодами'
+    });
+  } catch (e) {
+    console.error('Auto discount error:', e.message);
+    res.status(500).json({ applied: false, error: 'Ошибка расчёта автоскидки' });
   }
 });
 
@@ -245,8 +366,16 @@ app.post('/order/create', async (req, res) => {
         tags: 'freedom-pay',
       }
     };
-    // Apply the real Shopify discount code so Shopify recalculates the draft total.
-    if (discount_code) { try { const __dd = await lookupDiscount(String(discount_code).trim()); if (__dd && __dd.ok) { draftBody.draft_order.applied_discount = (__dd.type === 'percentage') ? { title: __dd.title || String(discount_code).trim(), value_type: 'percentage', value: String((Number(__dd.percentage)||0)*100), description: String(discount_code).trim() } : { title: __dd.title || String(discount_code).trim(), value_type: 'fixed_amount', value: String(Number(__dd.amount)||0), description: String(discount_code).trim() }; } } catch (e) {} }
+    // Ровно одна скидка на заказ: автоскидка приоритетна, ручной код при ней отклоняется.
+    const __res = await resolveDiscount({ items, cart_total: req.body.cart_total, code: discount_code });
+    if (__res.rejectedCode) {
+      return res.status(422).json({ error: __res.error, code: 'DISCOUNT_NOT_STACKABLE' });
+    }
+    if (!__res.discount && discount_code) {
+      return res.status(422).json({ error: __res.error || 'Промокод недействителен', code: 'DISCOUNT_ERROR' });
+    }
+    const __applied = appliedDiscountPayload(__res.discount);
+    if (__applied) draftBody.draft_order.applied_discount = __applied;
 
     const draftRes = await axios.post(
       'https://' + SHOPIFY_STORE + '/admin/api/' + API_VER + '/draft_orders.json',
@@ -255,19 +384,7 @@ app.post('/order/create', async (req, res) => {
     );
     const draft = draftRes.data.draft_order;
     const orderId = draft.id;
-    let amount = draft.total_price;
-
-    // Fallback: if the draft did not apply the code (total unchanged), recompute from the rule.
-    if (discount_code) {
-      try {
-        const d = await lookupDiscount(String(discount_code).trim());
-        if (d.ok) {
-          const base = Number(draft.total_price) || 0;
-          if (d.type === 'percentage') amount = amount;
-          else if (d.type === 'amount') amount = amount;
-        }
-      } catch (e) { /* keep draft.total_price */ }
-    }
+    const amount = draft.total_price;
 
     const result = await fpInitPayment({
       order_id: orderId,
@@ -438,7 +555,16 @@ app.post('/order/create-qr', async (req, res) => {
         tags: 'kompanion-qr',
       }
     };
-    if (discount_code) { try { const __dd = await lookupDiscount(String(discount_code).trim()); if (__dd && __dd.ok) { draftBody.draft_order.applied_discount = (__dd.type === 'percentage') ? { title: __dd.title || String(discount_code), value_type: 'percentage', value: String((Number(__dd.percentage)||0)*100) } : { title: __dd.title || String(discount_code), value_type: 'fixed_amount', value: String(__dd.amount) }; } } catch (e) {} }
+    // Ровно одна скидка на заказ: автоскидка приоритетна, ручной код при ней отклоняется.
+    const __res = await resolveDiscount({ items, cart_total: req.body.cart_total, code: discount_code });
+    if (__res.rejectedCode) {
+      return res.status(422).json({ error: __res.error, code: 'DISCOUNT_NOT_STACKABLE' });
+    }
+    if (!__res.discount && discount_code) {
+      return res.status(422).json({ error: __res.error || 'Промокод недействителен', code: 'DISCOUNT_ERROR' });
+    }
+    const __applied = appliedDiscountPayload(__res.discount);
+    if (__applied) draftBody.draft_order.applied_discount = __applied;
     const draftRes = await axios.post(
       'https://' + SHOPIFY_STORE + '/admin/api/' + API_VER + '/draft_orders.json',
       draftBody,
