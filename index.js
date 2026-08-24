@@ -331,8 +331,10 @@ app.post('/discount/auto', async (req, res) => {
       return res.json({
         applied: false, enabled: AUTO_DISCOUNT_ENABLED, min_qty: AUTO_DISCOUNT_MIN_QTY,
         new_total: total,
-        hint: (AUTO_DISCOUNT_ENABLED && need > 0)
-          ? ('Добавьте ещё ' + need + ' товар(ов) — скидка применится автоматически')
+              hint: (AUTO_DISCOUNT_ENABLED && need > 0)
+          ? ('Добавьте ещё ' + need + ' ' + pluralRu(need, 'товар', 'товара', 'товаров') +
+             ' — скидка ' + (AUTO_DISCOUNT_TYPE === 'percentage' ? AUTO_DISCOUNT_VALUE + '%' : AUTO_DISCOUNT_VALUE + ' ' + AUTO_DISCOUNT_CURRENCY) +
+             ' применится автоматически')
           : null
       });
     }
