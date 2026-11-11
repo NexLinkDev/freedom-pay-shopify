@@ -49,6 +49,36 @@ function randomSalt() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+const MIN_PAY_AMOUNT = Number(process.env.MIN_PAY_AMOUNT || 1); // минимальная сумма к оплате, сом
+
+// Если скидка (промокод/автоскидка) обнулила draft — уменьшаем её так, чтобы к оплате осталось MIN_PAY_AMOUNT.
+async function ensureMinPayable(draft) {
+  if (!draft || !draft.applied_discount || Number(draft.total_price) >= MIN_PAY_AMOUNT) return draft;
+  const gross = (draft.line_items || []).reduce((s, li) => s + Number(li.price || 0) * Number(li.quantity || 0), 0)
+    + Number((draft.shipping_line && draft.shipping_line.price) || 0);
+  if (gross < MIN_PAY_AMOUNT) return draft;
+  const capped = Math.round((gross - MIN_PAY_AMOUNT) * 100) / 100;
+  const ad = draft.applied_discount;
+  console.log('Discount capped for draft', draft.id, ': total', draft.total_price, '->', MIN_PAY_AMOUNT, '(discount', capped, 'instead of', ad.value, ad.value_type + ')');
+  const r = await axios.put(
+    'https://' + SHOPIFY_STORE + '/admin/api/' + API_VER + '/draft_orders/' + draft.id + '.json',
+    { draft_order: { id: draft.id, applied_discount: { title: ad.title, description: ad.description, value_type: 'fixed_amount', value: String(capped) } } },
+    { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } }
+  );
+  return r.data.draft_order;
+}
+
+// Нормализация и проверка email (Shopify отклоняет кривые адреса с 422 "email is invalid")
+function normalizeEmail(raw) {
+  const e = String(raw || '').replace(/\s+/g, '').toLowerCase();
+  return /^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$/.test(e) ? e : null;
+}
+function errSource(err) {
+  const url = (err && err.config && err.config.url) || '';
+  if (url.includes('myshopify.com') || url.includes('/admin/api/')) return 'SHOPIFY';
+  if (url.includes('kompanion')) return 'KOMPANION';
+  return 'APP';
+}
 function splitName(full) {
   const parts = String(full || '').trim().split(/\s+/).filter(Boolean);
   const first_name = parts.shift() || '';
@@ -245,6 +275,11 @@ function computeDiscount(d, cartTotal, items) {
   } else {
     return { error: 'Тип скидки не поддерживается' };
   }
+  // Минимум к оплате — MIN_PAY_AMOUNT сом: скидка не может обнулить заказ
+  if (total > 0 && total - discountAmt < MIN_PAY_AMOUNT) {
+    discountAmt = Math.max(0, total - MIN_PAY_AMOUNT);
+    summary = label + ' ' + discountAmt + ' ' + currency;
+  }
   return { eligible, discountAmt, new_total: Math.max(0, total - discountAmt), summary, currency };
 }
 
@@ -359,6 +394,12 @@ app.post('/order/create', async (req, res) => {
     if (!customer || !customer.name || !customer.phone || !customer.email) {
       return res.status(400).json({ error: 'Name, phone and email required' });
     }
+    const __email = normalizeEmail(customer.email);
+    if (!__email) {
+      console.warn('Invalid email rejected:', JSON.stringify(customer.email));
+      return res.status(400).json({ error: 'Некорректный email. Проверьте адрес (например: name@mail.com)', code: 'INVALID_EMAIL' });
+    }
+    customer.email = __email;
 
     const __nm = splitName(customer.name);
     const draftBody = {
@@ -392,9 +433,14 @@ app.post('/order/create', async (req, res) => {
       draftBody,
       { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } }
     );
-    const draft = draftRes.data.draft_order;
+    const draft = await ensureMinPayable(draftRes.data.draft_order);
     const orderId = draft.id;
     const amount = draft.total_price;
+    if (!(Number(amount) > 0)) {
+      console.error('Zero amount for draft', orderId, 'total_price=', amount);
+      try { await axios.delete('https://' + SHOPIFY_STORE + '/admin/api/' + API_VER + '/draft_orders/' + orderId + '.json', { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN } }); } catch (e) {}
+      return res.status(422).json({ error: 'Сумма заказа равна нулю — оплата невозможна', code: 'ZERO_AMOUNT' });
+    }
 
     const result = await fpInitPayment({
       order_id: orderId,
@@ -554,6 +600,12 @@ app.post('/order/create-qr', async (req, res) => {
     if (!customer || !customer.name || !customer.phone || !customer.email) {
       return res.status(400).json({ error: 'Name, phone and email required' });
     }
+    const __email = normalizeEmail(customer.email);
+    if (!__email) {
+      console.warn('Invalid email rejected:', JSON.stringify(customer.email));
+      return res.status(400).json({ error: 'Некорректный email. Проверьте адрес (например: name@mail.com)', code: 'INVALID_EMAIL' });
+    }
+    customer.email = __email;
     const __nm = splitName(customer.name);
     const draftBody = {
       draft_order: {
@@ -580,9 +632,14 @@ app.post('/order/create-qr', async (req, res) => {
       draftBody,
       { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN, 'Content-Type': 'application/json' } }
       );
-    const draft = draftRes.data.draft_order;
+    const draft = await ensureMinPayable(draftRes.data.draft_order);
     const orderId = draft.id;
     const amount = draft.total_price;
+    if (!(Number(amount) > 0)) {
+      console.error('Zero amount for draft', orderId, 'total_price=', amount);
+      try { await axios.delete('https://' + SHOPIFY_STORE + '/admin/api/' + API_VER + '/draft_orders/' + orderId + '.json', { headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN } }); } catch (e) {}
+      return res.status(422).json({ error: 'Сумма заказа равна нулю — оплата невозможна', code: 'ZERO_AMOUNT' });
+    }
     const result = await kompanionCreateOrder({
       order_id: orderId,
       amountSom: amount,
@@ -594,7 +651,10 @@ app.post('/order/create-qr', async (req, res) => {
   } catch (err) {
     const status = err.response && err.response.status;
     const data = err.response && err.response.data;
-    console.error('KOMPANION ERR:', status, err.message, data && JSON.stringify(data));
+    console.error(errSource(err) + ' ERR (create-qr):', status, err.message, data && JSON.stringify(data));
+    if (status === 422 && data && data.errors && data.errors.email) {
+      return res.status(400).json({ error: 'Некорректный email', code: 'INVALID_EMAIL' });
+    }
     res.status(500).json({ error: 'Order creation failed' });
   }
 });
@@ -611,8 +671,15 @@ if (String(sign) !== expected) {
   console.error('Kompanion callback: invalid signature for', txnId);
   return res.status(403).json({ error: 'invalid signature' });
 }
-    if (pgPool) { try { await pgPool.query('UPDATE kompanion_orders SET status = $2 WHERE txn_id = $1', [String(txnId), String(status)]); } catch (e) {} }
-    if (status === 'SUCCESS') { await confirmShopifyOrder(txnId, txnId); }
+    // Атомарно: завершаем draft только один раз, даже если callback пришёл дважды одновременно
+    let firstSuccess = status === 'SUCCESS';
+    if (pgPool) {
+      try {
+        const u = await pgPool.query("UPDATE kompanion_orders SET status = $2 WHERE txn_id = $1 AND status IS DISTINCT FROM 'SUCCESS'", [String(txnId), String(status)]);
+        if (status === 'SUCCESS' && u.rowCount === 0) { firstSuccess = false; console.log('Kompanion callback: duplicate SUCCESS ignored for', txnId); }
+      } catch (e) { console.error('kompanion status update error:', e.message); }
+    }
+    if (firstSuccess) { await confirmShopifyOrder(txnId, txnId); }
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error('Kompanion callback error:', e.message);
